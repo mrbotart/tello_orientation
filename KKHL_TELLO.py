@@ -1,4 +1,4 @@
-#TELLO_mrbotart
+"""Tello_mrbotart"""
 
 import time
 import cv2
@@ -10,9 +10,9 @@ FRAME_SIZE = (640, 480)          # Keep tags reasonably large for detection
 CX, CY = FRAME_SIZE[0] // 2, FRAME_SIZE[1] // 2
 TAG_WIDTH_M = 0.16              # Measure the black AprilTag square, not paper
 FOCAL_LENGTH_PX = 600.0         # ESTIMATE: calibrate using a known distance
-MIN_BATTERY = 10
+MIN_BATTERY = 20
 
-VIDEO_FPS = 15                   # Reduced from 15 FPS for weak Wi-Fi
+VIDEO_FPS = 15                  # Choose 5 if the Wi-Fi is still very poor
 VIDEO_BITRATE_MBPS = 1         # 1 Mbps reduces network load (may blur tags)
 FRAME_LOOP_SEC = 0.10          # ~10 control decisions/second
 VIDEO_HOVER_AFTER_SEC = 0.7    # No fresh video -> stop sending motion
@@ -39,18 +39,8 @@ SCAN_LIMIT_SEC = 75
 
 TAG_LOST_GRACE_SEC = 2.0
 
-MISSION_SPEED_CM_S = 25         # Explicit forward speed in cm/s
-RIGHT_TURN_DEG = 85             # Clockwise; change to 90 if needed
-GATE_UP_CM = 30                 # Height increase AFTER alignment, BEFORE passing
-# IMPORTANT: Up 30 cm at every gate means a cumulative +120 cm (not counting search shifts).
-# Check gate aperture and ceiling clearance before flying.
-# Gate entries: (AprilTag ID, target alignment distance, forward pass distance)
-GATES = [
-    (1, 200, 290),
-    (2, 200, 300),
-    (3, 180, 300),
-    (4, 200, 300),
-]
+MISSION_SPEED_CM_S = 25         # Explicit slow speed for long forward moves
+MISSION_SEGMENT_CM = 70        # Keeps individual move responses relatively short
 WINDOW = 'Tello Low WiFi / No Auto Land - Q to land'
 
 # =================== APRILTAG DETECTOR ===================
@@ -84,7 +74,7 @@ def stop_motion(force=False):
 
 
 def check_key():
-    if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q'), 27):
+    if cv2.waitKey(1) & 0xFF in (ord('q'), 27):
         raise KeyboardInterrupt('Q/ESC pressed')
 
 
@@ -351,74 +341,22 @@ def align_to_tag(target_id, target_dist_cm):
         time.sleep(FRAME_LOOP_SEC)
 
 
-def wait_for_fresh_video(label):
-    """Do not start a new scripted manoeuvre while video is stalled.
+def slow_forward(total_cm):
+    """Forward with explicit speed in short chunks to avoid long SDK timeouts.
 
-    This only verifies the decoder has provided a new frame; it cannot
-    guarantee that a command sent over Wi-Fi will actually be received.
+    go_xyz_speed x = forward in the drone's current body frame.
     """
-    print(f'WAIT FOR VIDEO: {label}')
-    stop_motion(force=True)
-    while True:
-        _tag, fresh = read_tag(-1, label)
-        if fresh:
-            return
-        stop_motion()
-        time.sleep(FRAME_LOOP_SEC)
-
-
-def one_forward_pass(distance_cm):
-    """Send ONE forward move, not repeated segments or a remaining-cm loop.
-
-    DJI Tello may reply only after finishing its movement. Use a timeout
-    long enough for distance/speed and do not resend if the reply is lost:
-    the drone may have performed the manoeuvre despite the missing ACK.
-    """
-    distance_cm = int(distance_cm)
-    if not (20 <= distance_cm <= 500):
-        raise ValueError('Forward distance must be between 20 and 500 cm')
-    speed = int(MISSION_SPEED_CM_S)
-    if not (10 <= speed <= 100):
-        raise ValueError('Forward speed must be between 10 and 100 cm/s')
-
-    command = f'go {distance_cm} 0 0 {speed}'
-    timeout = max(20.0, distance_cm / speed + 12.0)
-    print(f'ONE FORWARD PASS: {distance_cm} cm at {speed} cm/s'
-          f' (timeout {timeout:.1f}s; no retries)')
-    stop_motion(force=True)
-    # send_command_with_return sends the instruction once, without DJITelloPy's
-    # automatic command retry loop. An error/timeout means position is UNKNOWN.
-    reply = T.send_command_with_return(command, timeout=timeout)
-    if str(reply).strip().lower() != 'ok':
-        raise RuntimeError(
-            f'Forward completion unconfirmed ({reply!r}). '
-            'Do not proceed to yaw or the next gate.'
-        )
-    stop_motion(force=True)
-
-
-def pass_gate(tag_id, align_distance_cm, forward_distance_cm):
-    """For every gate: align -> up -> pass forward -> yaw right."""
-    print(f'\n========== GATE {tag_id} =========')
-    align_to_tag(tag_id, align_distance_cm)
-    stop_motion(force=True)
-
-    # A height change AFTER alignment changes the previously verified aperture
-    # position: use only if the gate is large enough for +GATE_UP_CM.
-    wait_for_fresh_video(f'GATE {tag_id}: READY TO GO UP')
-    print(f'GATE {tag_id}: UP {GATE_UP_CM} cm')
-    T.move_up(GATE_UP_CM)
-    stop_motion(force=True)
-
-    wait_for_fresh_video(f'GATE {tag_id}: READY TO PASS')
-    one_forward_pass(forward_distance_cm)
-
-    wait_for_fresh_video(f'GATE {tag_id}: READY TO TURN')
-    print(f'GATE {tag_id}: YAW RIGHT {RIGHT_TURN_DEG} degrees')
-    stop_motion(force=True)
-    T.rotate_clockwise(RIGHT_TURN_DEG)
-    stop_motion(force=True)
-    print(f'GATE {tag_id} DONE: facing roughly toward next gate')
+    remaining = total_cm
+    while remaining > 0:
+        # All chunks >=20cm; for original 290 / 300 cm each final chunk qualifies.
+        distance = min(MISSION_SEGMENT_CM, remaining)
+        if remaining - distance <= 20 and remaining > MISSION_SEGMENT_CM:
+            distance = remaining // 2
+        print(f'FORWARD {distance}cm at {MISSION_SPEED_CM_S}cm/s')
+        stop_motion(force=True)
+        T.go_xyz_speed(int(distance), 0, 0, MISSION_SPEED_CM_S)
+        remaining -= distance
+        time.sleep(0.35)
 
 
 def try_video_setting(fn, value, label):
@@ -471,9 +409,24 @@ def mission():
     time.sleep(1.0)
     T.move_up(40)
 
-    for tag_id, align_distance, forward_distance in GATES:
-        pass_gate(tag_id, align_distance, forward_distance)
+    align_to_tag(1, 200)
+    stop_motion(force=True)
+    T.move_up(30)
+    slow_forward(290)
 
+    align_to_tag(2, 200)
+    stop_motion(force=True)
+    slow_forward(300)
+    T.move_down(30)
+
+    align_to_tag(3, 180)
+    stop_motion(force=True)
+    slow_forward(300)
+
+    align_to_tag(4, 200)
+    stop_motion(force=True)
+    T.move_up(30)
+    slow_forward(300)
     print('MISSION COMPLETE: hovering until Q/ESC is pressed')
     wait_for_q()
 
